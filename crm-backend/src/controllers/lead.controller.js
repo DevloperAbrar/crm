@@ -15,58 +15,99 @@ async function resolveTeamLeadFor(bdeId) {
   return bde.role === 'bde' ? bde.reportsTo : null;
 }
 
+// Builds the Mongo filter for the leads list from the request's query string.
+// Shared by listLeads (paged rows) and listLeadIds (every matching id) so the
+// two can never disagree about which leads match the current filters.
+function buildListQuery(req) {
+  const {
+    status, city, state, categoryId, assignedTo, search, unassigned, tag,
+    phone, dateFrom, dateTo, minRating, maxRating,
+  } = req.query;
+
+  const query = buildLeadScopeQuery(req.scope);
+
+  if (status) query.status = status;
+  if (city) query.cityName = city;
+  if (state) query.stateCode = state;
+  if (categoryId) query.categoryId = categoryId;
+  if (assignedTo) query.assignedTo = assignedTo;
+  if (tag) query.tags = tag;
+  if (search) {
+    // Escape regex characters so searching "A.B. Road (Indore)" cannot throw.
+    const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    query.businessName = { $regex: safe, $options: 'i' };
+  }
+
+  // Phone search - matches on the normalised phone so formatting differences
+  // (+91, spaces, dashes) don't matter.
+  if (phone) query.normalizedPhone = normalizePhone(phone);
+
+  // Date-added range.
+  if (dateFrom || dateTo) {
+    query.createdAt = {};
+    if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
+    if (dateTo) query.createdAt.$lte = new Date(new Date(dateTo).setHours(23, 59, 59, 999));
+  }
+
+  // Google rating range.
+  if (minRating || maxRating) {
+    query.mapsRating = {};
+    if (minRating) query.mapsRating.$gte = Number(minRating);
+    if (maxRating) query.mapsRating.$lte = Number(maxRating);
+  }
+
+  if (unassigned === 'true' && req.scope.role === 'founder') {
+    query.assignedTo = null;
+  }
+
+  return query;
+}
+
+const MAX_PAGE_SIZE = 500;
+const MAX_SELECT_ALL = 5000;
+
 exports.listLeads = async (req, res) => {
   try {
-    const {
-      status, city, state, categoryId, assignedTo, search, unassigned, tag,
-      phone, dateFrom, dateTo, minRating, maxRating,
-      page = 1, limit = 25,
-    } = req.query;
+    const query = buildListQuery(req);
 
-    const query = buildLeadScopeQuery(req.scope);
-
-    if (status) query.status = status;
-    if (city) query.cityName = city;
-    if (state) query.stateCode = state;
-    if (categoryId) query.categoryId = categoryId;
-    if (assignedTo) query.assignedTo = assignedTo;
-    if (tag) query.tags = tag;
-    if (search) query.businessName = { $regex: search, $options: 'i' };
-
-    // New (Section 5.10): phone search - matches on the normalised phone so
-    // formatting differences (+91, spaces, dashes) don't matter.
-    if (phone) query.normalizedPhone = normalizePhone(phone);
-
-    // New (Section 5.10): date-added range.
-    if (dateFrom || dateTo) {
-      query.createdAt = {};
-      if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
-      if (dateTo) query.createdAt.$lte = new Date(new Date(dateTo).setHours(23, 59, 59, 999));
-    }
-
-    // New (Section 5.10): Google rating range.
-    if (minRating || maxRating) {
-      query.mapsRating = {};
-      if (minRating) query.mapsRating.$gte = Number(minRating);
-      if (maxRating) query.mapsRating.$lte = Number(maxRating);
-    }
-
-    if (unassigned === 'true' && req.scope.role === 'founder') {
-      query.assignedTo = null;
-    }
+    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limitNum = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.limit, 10) || 25));
 
     const leads = await Lead.find(query)
       .populate('assignedTo', 'name')
       .populate('categoryId', 'name colour')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
+      .sort({ createdAt: -1, _id: -1 }) // _id tie-break keeps pages stable
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum);
 
     const total = await Lead.countDocuments(query);
     const unassignedCount =
       req.scope.role === 'founder' ? await Lead.countDocuments({ assignedTo: null }) : 0;
 
-    return success(res, { leads, total, unassignedCount, page: Number(page), limit: Number(limit) });
+    return success(res, { leads, total, unassignedCount, page: pageNum, limit: limitNum });
+  } catch (err) {
+    return error(res, err.message, 500);
+  }
+};
+
+// Returns ONLY the ids of every lead matching the current filters (within the
+// caller's scope), so the UI can offer "Select all N leads" across pages
+// without downloading full lead documents.
+exports.listLeadIds = async (req, res) => {
+  try {
+    const query = buildListQuery(req);
+    const total = await Lead.countDocuments(query);
+
+    if (total > MAX_SELECT_ALL) {
+      return error(
+        res,
+        `${total} leads match. Narrow your filters to ${MAX_SELECT_ALL} or fewer to select them all at once.`,
+        422
+      );
+    }
+
+    const docs = await Lead.find(query).select('_id').sort({ createdAt: -1, _id: -1 }).lean();
+    return success(res, { ids: docs.map((d) => String(d._id)), total });
   } catch (err) {
     return error(res, err.message, 500);
   }

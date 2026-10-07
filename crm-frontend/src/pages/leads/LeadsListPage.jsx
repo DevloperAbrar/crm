@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   Users, ListChecks, X, Tag, GitMerge, SlidersHorizontal, ChevronLeft, ChevronRight,
 } from 'lucide-react';
@@ -18,7 +18,7 @@ const STATUSES = [
   'Demo/Visit Scheduled', 'Visited', 'Negotiation', 'Converted', 'Lost',
 ];
 
-const PAGE_SIZE = 25;
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 500];
 
 const EMPTY_ADVANCED = {
   phone: '', dateFrom: '', dateTo: '', minRating: '', maxRating: '',
@@ -40,6 +40,8 @@ export default function LeadsListPage() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [advanced, setAdvanced] = useState(EMPTY_ADVANCED);
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  const [selectingAll, setSelectingAll] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [mergeModalOpen, setMergeModalOpen] = useState(false);
@@ -50,32 +52,37 @@ export default function LeadsListPage() {
   const debouncedSearch = useDebounce(search);
   const debouncedAdvanced = useDebounce(advanced, 500);
 
+  // Filter params shared by the paged list and the "select all matching" call,
+  // so both always describe exactly the same set of leads.
+  const filterParams = useMemo(
+    () => ({
+      search: debouncedSearch,
+      unassigned: showUnassignedOnly && canSeeUnassigned ? 'true' : undefined,
+      phone: debouncedAdvanced.phone || undefined,
+      dateFrom: debouncedAdvanced.dateFrom || undefined,
+      dateTo: debouncedAdvanced.dateTo || undefined,
+      minRating: debouncedAdvanced.minRating || undefined,
+      maxRating: debouncedAdvanced.maxRating || undefined,
+      state: debouncedAdvanced.stateCode || undefined,
+      city: debouncedAdvanced.cityName || undefined,
+      categoryId: debouncedAdvanced.categoryId || undefined,
+      status: debouncedAdvanced.status || undefined,
+      assignedTo: debouncedAdvanced.assignedTo || undefined,
+      tag: debouncedAdvanced.tag || undefined,
+    }),
+    [debouncedSearch, showUnassignedOnly, canSeeUnassigned, debouncedAdvanced]
+  );
+
   const fetchLeads = useCallback(() => {
     leadApi
-      .list({
-        search: debouncedSearch,
-        unassigned: showUnassignedOnly && canSeeUnassigned ? 'true' : undefined,
-        phone: debouncedAdvanced.phone || undefined,
-        dateFrom: debouncedAdvanced.dateFrom || undefined,
-        dateTo: debouncedAdvanced.dateTo || undefined,
-        minRating: debouncedAdvanced.minRating || undefined,
-        maxRating: debouncedAdvanced.maxRating || undefined,
-        state: debouncedAdvanced.stateCode || undefined,
-        city: debouncedAdvanced.cityName || undefined,
-        categoryId: debouncedAdvanced.categoryId || undefined,
-        status: debouncedAdvanced.status || undefined,
-        assignedTo: debouncedAdvanced.assignedTo || undefined,
-        tag: debouncedAdvanced.tag || undefined,
-        page,
-        limit: PAGE_SIZE,
-      },{ skipErrorToast: true })
+      .list({ ...filterParams, page, limit: pageSize }, { skipErrorToast: true })
       .then((res) => {
         setLeads(res.data.data.leads);
         setTotal(res.data.data.total);
         setUnassignedCount(res.data.data.unassignedCount);
       })
       .catch((err) => toast.error(err.response?.data?.message || 'Could not load leads.'));
-  }, [debouncedSearch, showUnassignedOnly, canSeeUnassigned, debouncedAdvanced, page]);
+  }, [filterParams, page, pageSize]);
 
   useEffect(() => {
     fetchLeads();
@@ -87,6 +94,10 @@ export default function LeadsListPage() {
     // never hit leads that are no longer visible.
     setSelectedIds([]);
   }, [debouncedSearch, showUnassignedOnly, debouncedAdvanced]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [pageSize]);
 
   useEffect(() => {
     categoryApi.list().then((res) => setCategories(res.data.data)).catch(() => {});
@@ -113,6 +124,21 @@ export default function LeadsListPage() {
         ? Array.from(new Set([...prev, ...pageIds]))
         : prev.filter((id) => !pageIds.includes(id))
     );
+  };
+
+  // Gmail-style "select all N leads": fetches the ids of EVERY lead matching
+  // the current filters (not just this page) and selects them.
+  const selectAllMatching = async () => {
+    setSelectingAll(true);
+    try {
+      const res = await leadApi.ids(filterParams, { skipErrorToast: true });
+      setSelectedIds(res.data.data.ids);
+      toast.success(`${res.data.data.ids.length} lead(s) selected.`);
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Could not select all leads.');
+    } finally {
+      setSelectingAll(false);
+    }
   };
 
   const handleCreateLead = async (payload) => {
@@ -144,9 +170,16 @@ export default function LeadsListPage() {
   };
 
   const advancedActive = Object.values(advanced).some(Boolean);
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const rangeStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
-  const rangeEnd = Math.min(page * PAGE_SIZE, total);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const rangeStart = total === 0 ? 0 : (page - 1) * pageSize + 1;
+  const rangeEnd = Math.min(page * pageSize, total);
+
+  const pageIds = leads.map((l) => l._id);
+  const allOnPageSelected =
+    pageIds.length > 0 && pageIds.every((id) => selectedIds.includes(id));
+  const everythingSelected = total > 0 && selectedIds.length >= total;
+  const showSelectAllBanner =
+    canAssign && allOnPageSelected && total > pageIds.length && !everythingSelected;
 
   return (
     <div>
@@ -417,6 +450,27 @@ export default function LeadsListPage() {
         </div>
       )}
 
+      {showSelectAllBanner && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5 mb-4 text-sm text-amber-800 flex items-center gap-2 flex-wrap">
+          <span>All {pageIds.length} leads on this page are selected.</span>
+          <button
+            onClick={selectAllMatching}
+            disabled={selectingAll}
+            className="font-semibold underline disabled:opacity-50"
+          >
+            {selectingAll ? 'Selecting...' : `Select all ${total} leads`}
+          </button>
+        </div>
+      )}
+      {canAssign && everythingSelected && total > pageIds.length && (
+        <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-2.5 mb-4 text-sm text-green-800 flex items-center gap-2 flex-wrap">
+          <span>All {selectedIds.length} matching leads are selected.</span>
+          <button onClick={clearSelection} className="font-semibold underline">
+            Clear selection
+          </button>
+        </div>
+      )}
+
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
         {leads.length === 0 ? (
           <p className="text-sm text-gray-400 text-center py-10">
@@ -435,10 +489,24 @@ export default function LeadsListPage() {
               onToggleSelectAll={canAssign ? toggleSelectAllOnPage : undefined}
             />
 
-            <div className="flex items-center justify-between pt-4 mt-2 border-t border-gray-100 text-sm text-gray-500">
+            <div className="flex items-center justify-between flex-wrap gap-3 pt-4 mt-2 border-t border-gray-100 text-sm text-gray-500">
               <span>
                 Showing {rangeStart}-{rangeEnd} of {total}
               </span>
+              <label className="flex items-center gap-2">
+                Rows per page
+                <select
+                  className="border border-gray-300 rounded-lg px-2 py-1 text-sm"
+                  value={pageSize}
+                  onChange={(e) => setPageSize(Number(e.target.value))}
+                >
+                  {PAGE_SIZE_OPTIONS.map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => setPage((p) => Math.max(1, p - 1))}

@@ -10,6 +10,7 @@ router.use(authMiddleware, territoryMiddleware, auditLogger);
 
 router.get('/', leadController.listLeads);
 router.post('/', leadController.createLead);
+router.get('/ids', roleMiddleware('founder', 'team_lead'), leadController.listLeadIds);
 router.get('/duplicates', roleMiddleware('founder', 'team_lead'), leadController.findDuplicateGroups);
 router.get('/:id', leadController.getLeadProfile);
 router.put('/:id', leadController.updateLead);

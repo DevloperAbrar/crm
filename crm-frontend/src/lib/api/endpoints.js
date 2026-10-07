@@ -17,6 +17,7 @@ export const userApi = {
 
 export const leadApi = {
   list: (params, config) => api.get('/leads', { params, ...config }),
+  ids: (params, config) => api.get('/leads/ids', { params, ...config }),
   create: (payload, config) => api.post('/leads', payload, config),
   get: (id, config) => api.get(`/leads/${id}`, config),
   update: (id, payload, config) => api.put(`/leads/${id}`, payload, config),

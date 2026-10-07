@@ -5,8 +5,9 @@ const { buildStateResolver } = require('./stateResolver.service');
 const Lead = require('../models/Lead');
 const User = require('../models/User');
 const Category = require('../models/Category');
-const { findDuplicate, findWeakDuplicate } = require('./dedupe.service');
 const crypto = require('crypto');
+
+const INSERT_CHUNK_SIZE = 500;
 
 function httpError(message, status = 400) {
   const err = new Error(message);
@@ -58,6 +59,44 @@ function cleanCell(value) {
   return value;
 }
 
+function normalizeName(str) {
+  return String(str || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function weakKey(businessName, cityName) {
+  const n = normalizeName(businessName);
+  if (!n) return null;
+  return `${n}|${String(cityName || '').trim().toLowerCase()}`;
+}
+
+/**
+ * Loads every existing lead's dedupe signals ONCE (phone, placeId,
+ * name+city) so the import loop can check duplicates in memory instead of
+ * running several database queries per row. Leads accepted during this
+ * import are added to the same lookup, so duplicates inside the file itself
+ * are caught too.
+ */
+async function loadDedupeIndex() {
+  const byPhone = new Map();
+  const byPlaceId = new Map();
+  const byWeakKey = new Map();
+
+  const cursor = Lead.find({})
+    .select('businessName cityName normalizedPhone placeId')
+    .lean()
+    .cursor();
+
+  for await (const l of cursor) {
+    const ref = { _id: l._id, businessName: l.businessName };
+    if (l.normalizedPhone) byPhone.set(l.normalizedPhone, ref);
+    if (l.placeId) byPlaceId.set(l.placeId, ref);
+    const wk = weakKey(l.businessName, l.cityName);
+    if (wk && !byWeakKey.has(wk)) byWeakKey.set(wk, ref);
+  }
+
+  return { byPhone, byPlaceId, byWeakKey };
+}
+
 /**
  * Step 1: preview - just returns detected columns + sample rows for the
  * frontend's ColumnMapper component.
@@ -72,6 +111,10 @@ function previewImport(buffer, originalName) {
  * Step 2: commit - applies the column mapping, resolves each row's category,
  * de-duplicates, and inserts new Lead documents tagged with a batchId
  * (for undo support).
+ *
+ * Performance: all lookups (categories, states, existing leads) are loaded
+ * once up front and rows are inserted in bulk chunks, so a file with
+ * thousands of rows finishes in seconds rather than hitting proxy timeouts.
  *
  * Category resolution (per row):
  *   1. If the file has a column mapped to "category" and the cell has a
@@ -109,7 +152,11 @@ async function commitImport(buffer, originalName, columnMapping, categoryId, def
     );
   }
 
-  const categoryResolver = await buildCategoryResolver();
+  const [categoryResolver, stateResolver, dedupeIndex] = await Promise.all([
+    buildCategoryResolver(),
+    buildStateResolver(),
+    loadDedupeIndex(),
+  ]);
 
   // Resolve the assignee's Team Lead once up front (same lead owner for
   // every row in this batch), so every imported Lead's assignedTeamLead
@@ -128,8 +175,9 @@ async function commitImport(buffer, originalName, columnMapping, categoryId, def
   const invalidPhones = [];
   const byCategoryMap = new Map(); // categoryId string -> { categoryId, name, count }
   const unmatchedMap = new Map(); // normalised key -> { name, count, rows: [] }
-  const stateResolver = await buildStateResolver();
+  const pending = []; // rows accepted in pass 1, inserted in pass 2
 
+  // ---------- Pass 1: validate, categorise, de-duplicate (all in memory) ----------
   let rowNumber = 0;
   for (const row of rows) {
     rowNumber += 1;
@@ -181,35 +229,41 @@ async function commitImport(buffer, originalName, columnMapping, categoryId, def
         mapped.phone = undefined;
       }
 
-      const hasPhone = Boolean(normalizePhone(mapped.phone));
-      const hasPlaceId = Boolean(mapped.placeId);
+      const normalizedPhone = normalizePhone(mapped.phone) || undefined;
+      const placeId = mapped.placeId ? String(mapped.placeId) : undefined;
 
-      if (hasPhone || hasPlaceId) {
-        const dup = await findDuplicate({ phone: mapped.phone, placeId: mapped.placeId });
-        if (dup) {
-          skipped.push({
-            row: rowNumber,
-            businessName: mapped.businessName,
-            matchedOn: dup.matchedOn,
-            matchedLeadId: dup.lead._id,
-            matchedLeadName: dup.lead.businessName,
-          });
-          continue;
-        }
+      // ---- Strong duplicate check (phone, then placeId) ----
+      let strongMatch = null;
+      let matchedOn = null;
+      if (normalizedPhone && dedupeIndex.byPhone.has(normalizedPhone)) {
+        strongMatch = dedupeIndex.byPhone.get(normalizedPhone);
+        matchedOn = 'phone';
+      } else if (placeId && dedupeIndex.byPlaceId.has(placeId)) {
+        strongMatch = dedupeIndex.byPlaceId.get(placeId);
+        matchedOn = 'placeId';
       }
-
-      let flaggedAsPossibleDupe = null;
-      if (!hasPhone && !hasPlaceId) {
-        const weak = await findWeakDuplicate({
+      if (strongMatch) {
+        skipped.push({
+          row: rowNumber,
           businessName: mapped.businessName,
-          cityName: mapped.cityName,
+          matchedOn,
+          matchedLeadId: strongMatch._id,
+          matchedLeadName: strongMatch.businessName,
         });
-        if (weak) flaggedAsPossibleDupe = weak.lead;
+        continue;
       }
 
+      // ---- Weak duplicate check (only when no phone / placeId to rely on) ----
       const cityName = mapped.cityName ? String(mapped.cityName).trim() : undefined;
+      const wk = weakKey(mapped.businessName, cityName);
+      let flaggedAsPossibleDupe = null;
+      if (!normalizedPhone && !placeId && wk && dedupeIndex.byWeakKey.has(wk)) {
+        flaggedAsPossibleDupe = dedupeIndex.byWeakKey.get(wk);
+      }
 
-      const created = await Lead.create({
+      const _id = new mongoose.Types.ObjectId();
+      const doc = new Lead({
+        _id,
         businessName: mapped.businessName,
         categoryId: category._id,
         cityName,
@@ -222,8 +276,8 @@ async function commitImport(buffer, originalName, columnMapping, categoryId, def
         website: mapped.website,
         mapsRating: mapped.mapsRating,
         mapsReviewCount: mapped.mapsReviewCount,
-        placeId: mapped.placeId,
-        normalizedPhone: normalizePhone(mapped.phone),
+        placeId,
+        normalizedPhone,
         source: 'maps_scrape',
         status: 'New',
         tags: flaggedAsPossibleDupe ? ['possible_duplicate'] : [],
@@ -234,22 +288,30 @@ async function commitImport(buffer, originalName, columnMapping, categoryId, def
         nextFollowUpDate: null, // set automatically after the first call/visit is logged
         importBatchId: batchId,
       });
-      inserted += 1;
 
-      const catKey = String(category._id);
-      const catEntry = byCategoryMap.get(catKey) || { categoryId: catKey, name: category.name, count: 0 };
-      catEntry.count += 1;
-      byCategoryMap.set(catKey, catEntry);
-
-      if (flaggedAsPossibleDupe) {
-        flagged.push({
+      const validationError = doc.validateSync();
+      if (validationError) {
+        failed.push({
           row: rowNumber,
           businessName: mapped.businessName,
-          newLeadId: created._id,
-          possibleMatchId: flaggedAsPossibleDupe._id,
-          possibleMatchName: flaggedAsPossibleDupe.businessName,
+          reason: validationError.message,
         });
+        continue;
       }
+
+      // Register in the lookup so later rows in the same file see it.
+      const ref = { _id, businessName: mapped.businessName };
+      if (normalizedPhone) dedupeIndex.byPhone.set(normalizedPhone, ref);
+      if (placeId) dedupeIndex.byPlaceId.set(placeId, ref);
+      if (wk && !dedupeIndex.byWeakKey.has(wk)) dedupeIndex.byWeakKey.set(wk, ref);
+
+      pending.push({
+        row: rowNumber,
+        businessName: mapped.businessName,
+        doc,
+        category,
+        flaggedAsPossibleDupe,
+      });
     } catch (rowErr) {
       // One bad row must never abort the whole import.
       failed.push({
@@ -260,6 +322,57 @@ async function commitImport(buffer, originalName, columnMapping, categoryId, def
     }
   }
 
+  // ---------- Pass 2: bulk insert in chunks ----------
+  for (let i = 0; i < pending.length; i += INSERT_CHUNK_SIZE) {
+    const chunk = pending.slice(i, i + INSERT_CHUNK_SIZE);
+    const failedIdx = new Map();
+
+    try {
+      await Lead.insertMany(
+        chunk.map((p) => p.doc),
+        { ordered: false }
+      );
+    } catch (err) {
+      const writeErrors = err.writeErrors || err.result?.result?.writeErrors;
+      if (Array.isArray(writeErrors) && writeErrors.length) {
+        writeErrors.forEach((we) =>
+          failedIdx.set(we.index, we.errmsg || we.err?.errmsg || err.message)
+        );
+      } else {
+        chunk.forEach((_, idx) => failedIdx.set(idx, err.message));
+      }
+    }
+
+    chunk.forEach((p, idx) => {
+      if (failedIdx.has(idx)) {
+        failed.push({ row: p.row, businessName: p.businessName, reason: failedIdx.get(idx) });
+        return;
+      }
+
+      inserted += 1;
+
+      const catKey = String(p.category._id);
+      const catEntry = byCategoryMap.get(catKey) || {
+        categoryId: catKey,
+        name: p.category.name,
+        count: 0,
+      };
+      catEntry.count += 1;
+      byCategoryMap.set(catKey, catEntry);
+
+      if (p.flaggedAsPossibleDupe) {
+        flagged.push({
+          row: p.row,
+          businessName: p.businessName,
+          newLeadId: p.doc._id,
+          possibleMatchId: p.flaggedAsPossibleDupe._id,
+          possibleMatchName: p.flaggedAsPossibleDupe.businessName,
+        });
+      }
+    });
+  }
+
+  failed.sort((a, b) => a.row - b.row);
   const unmatchedCategories = Array.from(unmatchedMap.values()).sort((a, b) => b.count - a.count);
 
   return {

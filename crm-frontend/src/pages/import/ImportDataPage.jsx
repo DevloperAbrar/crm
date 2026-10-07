@@ -92,7 +92,16 @@ export default function ImportDataPage() {
         toast.success(`Imported ${data.inserted} lead(s) successfully.`);
       }
     } catch (err) {
-      const msg = err.response?.data?.message || 'Import failed';
+      let msg;
+      if (!err.response) {
+        msg =
+          'Could not get a response from the server (network error or timeout). Part of the file may already be imported - check the Leads page before retrying.';
+      } else if ([502, 503, 504].includes(err.response.status)) {
+        msg =
+          'The server took too long to respond. Part of the file may already be imported - check the Leads page before retrying.';
+      } else {
+        msg = err.response?.data?.message || 'Import failed';
+      }
       setError(msg);
       toast.error(msg);
     } finally {

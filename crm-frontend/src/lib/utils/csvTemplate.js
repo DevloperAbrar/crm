@@ -1,12 +1,17 @@
 // Column names here match what ColumnMapper/importParser.service.js
-// ultimately map to Lead fields (businessName, cityName, stateCode,
+// ultimately map to Lead fields (businessName, category, cityName, stateCode,
 // address, lat, lng, phone, email, website, mapsRating, mapsReviewCount,
 // placeId). Using these exact header names means a founder can skip the
 // column-mapping step entirely if they upload the template as-is, since
 // most import tools auto-match identical header names - though mapping
 // still works fine if they rename columns.
+//
+// The "category" column must contain the exact name of an existing category
+// (case and "&" vs "and" don't matter). Each row is filed under its own
+// category automatically on import.
 const TEMPLATE_HEADERS = [
   'businessName',
+  'category',
   'cityName',
   'stateCode',
   'address',
@@ -22,6 +27,7 @@ const TEMPLATE_HEADERS = [
 
 const DUMMY_ROW = {
   businessName: 'Rudrashri Events & Decor',
+  category: 'Decorator',
   cityName: 'Indore',
   stateCode: 'MP',
   address: '2 Sanskruti Smart City, near Aurobindo Hospital, Bhawrasla, Indore, Madhya Pradesh 453555',
@@ -46,13 +52,17 @@ function escapeCsvValue(value) {
 /**
  * Builds and downloads a CSV template with the standard headers plus one
  * dummy row so whoever fills it in can see the expected format at a glance.
- * Optionally appends the selected category's custom field names as extra
- * trailing columns (informational only - see note in ImportDataPage.jsx
- * about how these currently aren't auto-mapped on commit).
+ * If a category is selected, its name is used in the example row and its
+ * custom field names are appended as extra trailing columns
+ * (informational only - they aren't auto-mapped on commit).
  */
 export function downloadImportTemplate(category = null) {
   const headers = [...TEMPLATE_HEADERS];
   const dummyRow = { ...DUMMY_ROW };
+
+  if (category?.name) {
+    dummyRow.category = category.name;
+  }
 
   if (category?.customFields?.length) {
     category.customFields.forEach((field) => {

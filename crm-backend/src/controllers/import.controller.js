@@ -8,7 +8,7 @@ exports.previewImportFile = async (req, res) => {
     const preview = previewImport(req.file.buffer, req.file.originalname);
     return success(res, preview);
   } catch (err) {
-    return error(res, err.message, 500);
+    return error(res, err.message, err.status || 500);
   }
 };
 
@@ -16,22 +16,30 @@ exports.commitImportFile = async (req, res) => {
   try {
     if (!req.file) return error(res, 'No file uploaded', 400);
 
-    const columnMapping = JSON.parse(req.body.columnMapping || '{}');
+    let columnMapping;
+    try {
+      columnMapping = JSON.parse(req.body.columnMapping || '{}');
+    } catch (parseErr) {
+      return error(res, 'Invalid column mapping', 400);
+    }
+
+    // categoryId is now OPTIONAL - it acts as the default category for rows
+    // whose category cell is blank (or for files with no category column).
     const { categoryId, defaultAssignee } = req.body;
 
     const result = await commitImport(
       req.file.buffer,
       req.file.originalname,
       columnMapping,
-      categoryId,
-      defaultAssignee
+      categoryId || null,
+      defaultAssignee || null
     );
 
     if (req.audit) await req.audit('import.committed', 'leads', req.user._id, null, result);
 
     return success(res, result, 'Import committed');
   } catch (err) {
-    return error(res, err.message, 500);
+    return error(res, err.message, err.status || 500);
   }
 };
 
@@ -41,6 +49,6 @@ exports.undoImportBatch = async (req, res) => {
     if (req.audit) await req.audit('import.undone', 'leads', req.user._id, null, result);
     return success(res, result, 'Import batch rolled back');
   } catch (err) {
-    return error(res, err.message, 500);
+    return error(res, err.message, err.status || 500);
   }
 };

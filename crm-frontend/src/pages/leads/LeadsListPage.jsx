@@ -83,6 +83,9 @@ export default function LeadsListPage() {
 
   useEffect(() => {
     setPage(1);
+    // Filters/search changed: drop the old selection so a bulk action can
+    // never hit leads that are no longer visible.
+    setSelectedIds([]);
   }, [debouncedSearch, showUnassignedOnly, debouncedAdvanced]);
 
   useEffect(() => {
@@ -100,6 +103,17 @@ export default function LeadsListPage() {
   };
 
   const clearSelection = () => setSelectedIds([]);
+
+  // Header "select all" checkbox: ticks / unticks every lead on the CURRENT
+  // page. Selections made on other pages are kept.
+  const toggleSelectAllOnPage = (shouldSelect) => {
+    const pageIds = leads.map((l) => l._id);
+    setSelectedIds((prev) =>
+      shouldSelect
+        ? Array.from(new Set([...prev, ...pageIds]))
+        : prev.filter((id) => !pageIds.includes(id))
+    );
+  };
 
   const handleCreateLead = async (payload) => {
     try {
@@ -418,6 +432,7 @@ export default function LeadsListPage() {
               leads={leads}
               selectedIds={selectedIds}
               onToggleSelect={canAssign ? toggleSelect : undefined}
+              onToggleSelectAll={canAssign ? toggleSelectAllOnPage : undefined}
             />
 
             <div className="flex items-center justify-between pt-4 mt-2 border-t border-gray-100 text-sm text-gray-500">
